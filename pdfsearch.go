@@ -30,77 +30,69 @@ type PDFFileMatch struct {
 	matchedPages map[int][]string
 }
 
-func collectPDFFiles(pdfFileChannel chan<- os.FileInfo) {
+func processorPDFDiscover(pdfFileChannel chan<- string) {
+	// TODO recursive
 	files, err := ioutil.ReadDir(".")
 	if err != nil {
 		panic(err)
 	}
-	pdfFiles := make([]os.FileInfo, 0)
 	for _, file := range files {
 		if !file.IsDir() {
 			if strings.HasSuffix(strings.ToLower(file.Name()), ".pdf") {
-				pdfFiles = append(pdfFiles, file)
+				path, err := filepath.Abs("./" + file.Name())
+				if err != nil {
+					panic(err)
+				}
+				pdfFileChannel <- path
 			}
 		}
 	}
-	for _, pdfFile := range pdfFiles {
-		pdfFileChannel <- pdfFile
-	}
 }
 
-func processPDFFiles(pdfFileChannel <-chan os.FileInfo, pdfPagesChannel chan *PDFPageProcessing, pdfMatchesChannel chan<- *PDFPageMatch, search string) {
-PROCESSLOOP:
+func processorPDFFiles(pdfFileChannel <-chan string, pdfPagesChannel chan<- *PDFPageProcessing, group *sync.WaitGroup) {
 	for {
-		select {
-		case pdfFile := <-pdfFileChannel:
-			res, err := filepath.Abs("./" + pdfFile.Name())
-			if err != nil {
-				panic(err)
-			}
-			processPDFFile(res, pdfPagesChannel)
-		case pdfPage := <-pdfPagesChannel:
-			match := processPDFPage(pdfPage, search)
-			if match != nil {
-				pdfMatchesChannel <- match
-			}
-		default:
-			break PROCESSLOOP
+		pdfPath, ok := <-pdfFileChannel
+		if !ok {
+			break
+		}
+		cmd := exec.Command("pdftotext", pdfPath, "-")
+		var buffer bytes.Buffer
+		cmd.Stdout = &buffer
+		cmd.Run()
+		stringding := buffer.String()
+		pages := strings.Split(stringding, "\f")
+		for pi, page := range pages[:len(pages)-1] {
+			pdfPagesChannel <- &PDFPageProcessing{
+				path:    pdfPath,
+				number:  pi + 1,
+				content: page}
 		}
 	}
+	group.Done()
 }
 
-func processPDFFile(path string, pdfPagesChannel chan<- *PDFPageProcessing) {
-	cmd := exec.Command("pdftotext", path, "-")
-	var buffer bytes.Buffer
-	cmd.Stdout = &buffer
-	cmd.Run()
-	stringding := buffer.String()
-	pages := strings.Split(stringding, "\f")
-	for pi, page := range pages[:len(pages)-1] {
-		pdfPagesChannel <- &PDFPageProcessing{
-			path:    path,
-			number:  pi + 1,
-			content: page}
-	}
-}
-
-func processPDFPage(page *PDFPageProcessing, search string) *PDFPageMatch {
-	var matchedLines []string
-	lines := strings.Split(page.content, "\n")
-	for _, line := range lines {
-		// TODO case insensitive
-		if strings.Contains(line, search) {
-			matchedLines = append(matchedLines, line)
+func processorPDFPages(pdfPagesChannel <-chan *PDFPageProcessing, pdfMatchesChannel chan<- *PDFPageMatch, search string, group *sync.WaitGroup) {
+	for {
+		pdfPage, ok := <-pdfPagesChannel
+		if !ok {
+			break
+		}
+		var matchedLines []string
+		lines := strings.Split(pdfPage.content, "\n")
+		for _, line := range lines {
+			// TODO case insensitive
+			if strings.Contains(line, search) {
+				matchedLines = append(matchedLines, line)
+			}
+		}
+		if len(matchedLines) != 0 {
+			pdfMatchesChannel <- &PDFPageMatch{
+				path:         pdfPage.path,
+				number:       pdfPage.number,
+				matchedLines: matchedLines}
 		}
 	}
-	if len(matchedLines) != 0 {
-		return &PDFPageMatch{
-			path:         page.path,
-			number:       page.number,
-			matchedLines: matchedLines}
-	} else {
-		return nil
-	}
+	group.Done()
 }
 
 func main() {
@@ -109,36 +101,47 @@ func main() {
 		fmt.Println("Please provide a search term")
 		os.Exit(1)
 	}
-
 	search := strings.Join(os.Args[1:], " ")
 
 	// allocate channels
-	// TODO limits?
-	pdfFileChannel := make(chan os.FileInfo, 1000)
-	pdfPagesChannel := make(chan *PDFPageProcessing, 10000)
-	pdfMatchesChannel := make(chan *PDFPageMatch, 10000)
+	pdfFileChannel := make(chan string, runtime.NumCPU())
+	pdfPagesChannel := make(chan *PDFPageProcessing, 5*runtime.NumCPU())
+	pdfMatchesChannel := make(chan *PDFPageMatch, 10*runtime.NumCPU())
 
-	// collect PDF files from folder
-	collectPDFFiles(pdfFileChannel)
+	var wgFiles, wgPages, wgFinish sync.WaitGroup
+	wgFiles.Add(runtime.NumCPU())
+	wgPages.Add(runtime.NumCPU())
+	wgFinish.Add(3)
 
-	// process PDF files
-	var wg sync.WaitGroup
-	wg.Add(runtime.NumCPU())
+	// start processing pipeline
+	go func() {
+		// step 1: PDF file discovery
+		processorPDFDiscover(pdfFileChannel)
+		close(pdfFileChannel)
+		wgFinish.Done()
+	}()
 	for i := 0; i < runtime.NumCPU(); i++ {
-		go func(i int) {
-			processPDFFiles(pdfFileChannel, pdfPagesChannel, pdfMatchesChannel, search)
-			wg.Done()
-		}(i)
+		// step 2: PDF to text per page conversion
+		go processorPDFFiles(pdfFileChannel, pdfPagesChannel, &wgFiles)
+		// step 3: search with term on PDF pages
+		go processorPDFPages(pdfPagesChannel, pdfMatchesChannel, search, &wgPages)
 	}
-	wg.Wait()
+	go func() {
+		wgFiles.Wait()
+		close(pdfPagesChannel)
+		wgFinish.Done()
+	}()
+	go func() {
+		wgPages.Wait()
+		close(pdfMatchesChannel)
+		wgFinish.Done()
+	}()
 
-	// close channels
-	close(pdfFileChannel)
-	close(pdfPagesChannel)
-	close(pdfMatchesChannel)
+	// wait for pipeline to finish
+	wgFinish.Wait()
 
 	// order matches
-	fileMatches := make(map[string]*PDFFileMatch, 0)
+	fileMatches := make(map[string]*PDFFileMatch)
 	for match := range pdfMatchesChannel {
 		elem, ok := fileMatches[match.path]
 		if ok {
