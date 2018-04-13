@@ -30,26 +30,28 @@ type PDFFileMatch struct {
 	matchedPages map[int][]string
 }
 
-func processorPDFDiscover(pdfFileChannel chan<- string) {
+func processorPDFDiscover(pdfFileChannel chan<- string) error {
 	// TODO recursive
 	files, err := ioutil.ReadDir(".")
 	if err != nil {
-		panic(err)
+		return err
 	}
 	for _, file := range files {
 		if !file.IsDir() {
 			if strings.HasSuffix(strings.ToLower(file.Name()), ".pdf") {
 				path, err := filepath.Abs("./" + file.Name())
 				if err != nil {
-					panic(err)
+					return err
 				}
 				pdfFileChannel <- path
 			}
 		}
 	}
+	return nil
 }
 
-func processorPDFFiles(pdfFileChannel <-chan string, pdfPagesChannel chan<- *PDFPageProcessing, group *sync.WaitGroup) {
+func processorPDFFiles(pdfFileChannel <-chan string, pdfPagesChannel chan<- *PDFPageProcessing, group *sync.WaitGroup) error {
+	defer group.Done()
 	for {
 		pdfPath, ok := <-pdfFileChannel
 		if !ok {
@@ -59,8 +61,8 @@ func processorPDFFiles(pdfFileChannel <-chan string, pdfPagesChannel chan<- *PDF
 		var buffer bytes.Buffer
 		cmd.Stdout = &buffer
 		cmd.Run()
-		stringding := buffer.String()
-		pages := strings.Split(stringding, "\f")
+		cmdOut := buffer.String()
+		pages := strings.Split(cmdOut, "\f")
 		for pi, page := range pages[:len(pages)-1] {
 			pdfPagesChannel <- &PDFPageProcessing{
 				path:    pdfPath,
@@ -68,10 +70,11 @@ func processorPDFFiles(pdfFileChannel <-chan string, pdfPagesChannel chan<- *PDF
 				content: page}
 		}
 	}
-	group.Done()
+	return nil
 }
 
-func processorPDFPages(pdfPagesChannel <-chan *PDFPageProcessing, pdfMatchesChannel chan<- *PDFPageMatch, search string, group *sync.WaitGroup) {
+func processorPDFPages(pdfPagesChannel <-chan *PDFPageProcessing, pdfMatchesChannel chan<- *PDFPageMatch, search string, group *sync.WaitGroup) error {
+	defer group.Done()
 	for {
 		pdfPage, ok := <-pdfPagesChannel
 		if !ok {
@@ -92,7 +95,7 @@ func processorPDFPages(pdfPagesChannel <-chan *PDFPageProcessing, pdfMatchesChan
 				matchedLines: matchedLines}
 		}
 	}
-	group.Done()
+	return nil
 }
 
 func main() {
